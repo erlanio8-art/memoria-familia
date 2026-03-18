@@ -386,7 +386,7 @@ body{font-family:'Nunito',sans-serif;background:var(--bg);color:#fff;min-height:
     <div class="win-stat hi"><div class="win-stat-lbl">Pontuação</div><div class="win-stat-val" id="winScoreEl">—</div></div>
   </div>
   <div class="podium" id="multiPodium" style="display:none"></div>
-  <button class="btn btn-primary"   id="playAgainBtn" onclick="restartGame()">🔄 Jogar Novamente</button>
+  <button class="btn btn-primary"   id="playAgainBtn" onclick="handlePlayAgain()">🔄 Jogar Novamente</button>
   <button class="btn btn-secondary" onclick="showScreen('leaderboard')">🏆 Ver Recordes</button>
   <button class="btn btn-small"     onclick="showScreen('home')">🏠 Home</button>
 </div>
@@ -578,6 +578,7 @@ function createRoom(){
     document.getElementById('hostStatusDot').className='status-dot connected';
     document.getElementById('hostStatusText').textContent='Conectado! Iniciando jogo...';
     conn.on('open',()=>{
+      onlinePeerReconnected();
       // Wait for HELLO from guest before sending anything
       // (HELLO handler will drive the full game start)
     });
@@ -611,9 +612,16 @@ function joinRoom(){
   peer.on('open',()=>{
     conn=peer.connect('MF-'+code);
     conn.on('open',()=>{
+      onlinePeerReconnected();
+      // Only send HELLO on first open (not on ICE renegotiation reopens)
+      if(!myOnlineName) return;
       statusDot.className='status-dot connected';
       statusTxt.textContent='Conectado! Aguardando início...';
-      conn.send({type:'HELLO',name:myOnlineName});
+      // Use a flag to avoid sending HELLO twice on renegotiation
+      if(!conn._helloSent){
+        conn._helloSent = true;
+        safeSend({type:'HELLO',name:myOnlineName});
+      }
     });
     conn.on('data',handleOnlineMessage);
     conn.on('close',()=>onlinePeerDisconnected());
@@ -638,18 +646,7 @@ function handleOnlineMessage(msg){
       msg.photos.forEach(p => photos.push(p));
       break;
 
-    case 'START_DONE':
-      // Guest: all photos received — build players and start game
-      opponentName = msg.hostName;
-      players=[
-        {name:msg.hostName, avatar:AVATARS[0],color:COLORS[0],bg:BGS[0],score:0,moves:0},
-        {name:myOnlineName, avatar:AVATARS[1],color:COLORS[1],bg:BGS[1],score:0,moves:0},
-      ];
-      setTimeout(()=>{
-        seededShuffle(msg.seed);
-        launchOnlineGame();
-      }, 50);
-      break;
+
 
     case 'HELLO': {
       // Host receives guest name — set up players and send photos in chunks
@@ -673,19 +670,52 @@ function handleOnlineMessage(msg){
       remoteFlip(msg.idx);
       break;
 
-    case 'RESTART':
-      // For guest, photos already set; seededShuffle picks correct array
-      seededShuffle(msg.seed);
-      resetOnlineBoard();
+    case 'RESTART_BEGIN':
+      // Host is about to resend photos + new seed — clear photos to receive fresh
+      photos = [];
+      break;
+
+    case 'START_DONE':
+      // Also handles restart: guest receives new shuffled board
+      opponentName = msg.hostName;
+      if(!players.length){
+        players=[
+          {name:msg.hostName, avatar:AVATARS[0],color:COLORS[0],bg:BGS[0],score:0,moves:0},
+          {name:myOnlineName, avatar:AVATARS[1],color:COLORS[1],bg:BGS[1],score:0,moves:0},
+        ];
+      }
+      setTimeout(()=>{
+        seededShuffle(msg.seed);
+        // If game was running, reset board; otherwise full launch
+        if(document.getElementById('game').classList.contains('active')){
+          resetOnlineBoard();
+        } else {
+          launchOnlineGame();
+        }
+      }, 50);
       break;
   }
 }
 
+let disconnectTimer = null;
+
 function onlinePeerDisconnected(){
-  // Ignore spurious close events during initial handshake / photo transfer
-  // Only react after the board has been built and shown
-  if(!document.getElementById('game').classList.contains('active')) return;
-  showToast('⚠️ Conexão perdida com o outro jogador',4000);
+  // PeerJS sometimes fires close/reopen during ICE renegotiation — use a grace period
+  // before treating it as a real disconnection
+  clearTimeout(disconnectTimer);
+  disconnectTimer = setTimeout(()=>{
+    // After grace period, check if conn is still dead
+    if(conn && conn.open) return; // reconnected, ignore
+    const gameActive = document.getElementById('game').classList.contains('active');
+    const winActive  = document.getElementById('win').classList.contains('active');
+    if(!gameActive && !winActive) return; // in lobby/home, ignore
+    showToast('⚠️ Conexão perdida com o outro jogador',4000);
+  }, 3000); // 3 second grace period for ICE renegotiation
+}
+
+function onlinePeerReconnected(){
+  // Called when conn reopens after ICE renegotiation — cancel any pending disconnect
+  clearTimeout(disconnectTimer);
 }
 
 function cancelOnline(){
@@ -713,7 +743,7 @@ function sendPhotosInChunks(photoArr, hostName, seed){
 
   function sendNext(){
     const batch = photoArr.slice(sent, sent + CHUNK);
-    conn.send({
+    safeSend({
       type: sent === 0 ? 'START_BEGIN' : 'START_CHUNK',
       photos: batch,
       offset: sent,
@@ -725,7 +755,7 @@ function sendPhotosInChunks(photoArr, hostName, seed){
     if(sent < total){
       setTimeout(sendNext, 80);
     } else {
-      conn.send({type:'START_DONE', hostName, seed, total});
+      safeSend({type:'START_DONE', hostName, seed, total});
     }
   }
   sendNext();
@@ -821,13 +851,29 @@ function buildBoardFromCards(){
   });
 }
 
+function handlePlayAgain(){
+  if(isOnline && !isHost){
+    showToast('Aguarde o anfitrião reiniciar a sala 🏠',2500);
+    return;
+  }
+  restartGame();
+}
+
 function restartGame(){
   if(isOnline){
     if(!isHost){showToast('Só quem criou a sala pode reiniciar!');return;}
+    // Re-send photos in chunks so guest gets a fresh board
     const restartSeed=Date.now();
-    seededShuffle(restartSeed);
-    conn.send({type:'RESTART',seed:restartSeed});
-    resetOnlineBoard();
+    // First notify guest to prepare for new game
+    safeSend({type:'RESTART_BEGIN'});
+    // Then send photos again with new seed
+    setTimeout(()=>{
+      sendPhotosInChunks(photosOnline, myOnlineName, restartSeed);
+      setTimeout(()=>{
+        seededShuffle(restartSeed);
+        resetOnlineBoard();
+      }, 200 + photosOnline.length * 20);
+    }, 100);
   }else{
     turn=0;buildLocalBoard();showScreen('game');refreshTurnBanner(true);
   }
@@ -863,11 +909,19 @@ function refreshTurnBanner(animate=false){
 }
 
 // ═══════════════════════════════ FLIP LOGIC ══════════════════════════════
+function safeSend(msg){
+  try{
+    if(conn && conn.open) conn.send(msg);
+  }catch(e){
+    console.warn('safeSend failed:', e);
+  }
+}
+
 function onCardClick(idx,el){
   // In online mode, only allow clicking if it's my turn
   if(isOnline&&turn!==myTurnIndex){showToast('Aguarde a sua vez! ⏳',1200);return;}
-  if(flipCard(idx,el)&&isOnline&&conn){
-    conn.send({type:'FLIP',idx});
+  if(flipCard(idx,el)&&isOnline){
+    safeSend({type:'FLIP',idx});
   }
 }
 
@@ -937,6 +991,8 @@ function checkMatch(){
 
 // ═══════════════════════════════ WIN ════════════════════════════════════
 function winGame(){
+  if(!gameRunning) return; // guard against double-call from stale timeouts
+  gameRunning=false;
   clearInterval(timerHandle);sfx.win();launchConfetti();
   if(numPlayers===1){
     const score=Math.max(100,Math.floor((10000/Math.max(totalMoves,1))*(300/Math.max(timerSec,1))*10));
