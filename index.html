@@ -63,7 +63,7 @@ body{font-family:'Nunito',sans-serif;background:var(--bg);color:#fff;min-height:
 .upload-icon{font-size:2.5rem;margin-bottom:8px;}
 .upload-text{font-size:.95rem;color:rgba(255,255,255,.7);}
 .upload-sub{font-size:.8rem;color:rgba(255,255,255,.4);margin-top:4px;}
-#fileInput{display:none;}
+#fileInput,#fileInputOnline{display:none;}
 .photos-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-top:12px;}
 .photo-thumb{aspect-ratio:1;border-radius:8px;overflow:hidden;position:relative;background:rgba(255,255,255,.05);border:1.5px solid rgba(255,255,255,.1);}
 .photo-thumb img{width:100%;height:100%;object-fit:cover;display:block;}
@@ -234,7 +234,7 @@ body{font-family:'Nunito',sans-serif;background:var(--bg);color:#fff;min-height:
   <div class="home-buttons">
     <button class="btn btn-primary"   onclick="showScreen('setup')">▶ Jogo Local</button>
     <button class="btn btn-online"    onclick="showScreen('online-lobby')">🌐 Jogar Online / WiFi</button>
-    <button class="btn btn-secondary" onclick="showScreen('leaderboard')">🏆 Recordes</button>
+    <button class="btn btn-secondary" onclick="openLeaderboard()">🏆 Recordes</button>
   </div>
 </div>
 
@@ -324,7 +324,7 @@ body{font-family:'Nunito',sans-serif;background:var(--bg);color:#fff;min-height:
     <div class="section-card">
       <div class="section-label">🔑 Código da Sala</div>
       <div class="code-input-row">
-        <input type="text" class="code-input" id="roomCodeInput" placeholder="Cole o código aqui..." maxlength="36">
+        <input type="text" class="code-input" id="roomCodeInput" placeholder="Cole o código aqui..." maxlength="6" autocomplete="off" autocapitalize="characters">
       </div>
     </div>
 
@@ -332,7 +332,7 @@ body{font-family:'Nunito',sans-serif;background:var(--bg);color:#fff;min-height:
       💡 Quem entra na sala <strong>não precisa adicionar fotos</strong> — elas serão recebidas automaticamente de quem criou a sala.
     </div>
 
-    <button class="btn btn-online" onclick="joinRoom()">🚪 Entrar na Sala</button>
+    <button class="btn btn-online" id="joinRoomBtn" onclick="joinRoom()">🚪 Entrar na Sala</button>
 
     <div class="status-line" id="joinStatusLine" style="display:none">
       <div class="status-dot waiting" id="joinStatusDot"></div>
@@ -387,15 +387,15 @@ body{font-family:'Nunito',sans-serif;background:var(--bg);color:#fff;min-height:
   </div>
   <div class="podium" id="multiPodium" style="display:none"></div>
   <button class="btn btn-primary"   id="playAgainBtn" onclick="handlePlayAgain()">🔄 Jogar Novamente</button>
-  <button class="btn btn-secondary" onclick="showScreen('leaderboard')">🏆 Ver Recordes</button>
-  <button class="btn btn-small"     onclick="showScreen('home')">🏠 Home</button>
+  <button class="btn btn-secondary" onclick="openLeaderboard()">🏆 Ver Recordes</button>
+  <button class="btn btn-small"     onclick="goHome()">🏠 Home</button>
 </div>
 
 <!-- LEADERBOARD -->
 <div id="leaderboard" class="screen">
   <div class="page-title">🏆 Recordes</div>
   <div class="lb-list" id="lbList"></div>
-  <button class="btn btn-small" onclick="showScreen('home')">← Voltar</button>
+  <button class="btn btn-small" onclick="goHome()">← Voltar</button>
 </div>
 
 <div class="toast" id="toastEl"></div>
@@ -431,6 +431,12 @@ let conn         = null;
 let myOnlineName = '';
 let opponentName = '';
 let myTurnIndex  = 0; // 0 = host, 1 = guest
+let uploadBusy   = {local:false,online:false};
+let gameTimeouts = new Set();
+let onlineTimeouts = new Set();
+let incomingPhotoTotal = 0;
+let incomingPhotoParts = new Map();
+let onlineStarted = false;
 
 // ═══════════════════════════════ AUDIO ═══════════════════════════════════
 let actx = null;
@@ -458,12 +464,26 @@ function showScreen(name){
   document.getElementById(name).classList.add('active');
   if(name==='leaderboard')renderLB();
 }
+function openLeaderboard(){
+  clearInterval(timerHandle);gameRunning=false;clearGameTimeouts();
+  if(isOnline)cancelOnline();
+  showScreen('leaderboard');
+}
 function goHome(){
   if(gameRunning&&totalMatched<15){if(!confirm('Sair do jogo atual?'))return;}
-  clearInterval(timerHandle);
+  clearInterval(timerHandle);gameRunning=false;clearGameTimeouts();
   if(isOnline)cancelOnline();
   showScreen('home');
 }
+
+function trackedTimeout(fn,ms,bucket){
+  const id=setTimeout(()=>{bucket.delete(id);fn();},ms);bucket.add(id);return id;
+}
+function gameDelay(fn,ms){return trackedTimeout(fn,ms,gameTimeouts);}
+function onlineDelay(fn,ms){return trackedTimeout(fn,ms,onlineTimeouts);}
+function clearTimeoutBucket(bucket){bucket.forEach(id=>clearTimeout(id));bucket.clear();}
+function clearGameTimeouts(){clearTimeoutBucket(gameTimeouts);}
+function clearOnlineTimeouts(){clearTimeoutBucket(onlineTimeouts);}
 
 // ═══════════════════════════════ TOAST ═══════════════════════════════════
 let toastTimeout=null;
@@ -487,16 +507,76 @@ uaOnline.addEventListener('dragover',e=>{e.preventDefault();uaOnline.classList.a
 uaOnline.addEventListener('dragleave',()=>uaOnline.classList.remove('drag'));
 uaOnline.addEventListener('drop',e=>{e.preventDefault();uaOnline.classList.remove('drag');readFiles(e.dataTransfer.files,true);});
 
-function readFiles(list,online){
-  const target=online?photosOnline:photos;
-  Array.from(list).filter(f=>f.type.startsWith('image/')).forEach(f=>{
-    if(target.length>=15)return;
-    const r=new FileReader();
-    r.onload=ev=>{if(target.length<15){target.push(ev.target.result);renderPhotos(online);}};
-    r.readAsDataURL(f);
+const MAX_SOURCE_BYTES=15*1024*1024;
+const TARGET_IMAGE_BYTES=180*1024;
+
+function blobToDataURL(blob){
+  return new Promise((resolve,reject)=>{
+    const reader=new FileReader();reader.onload=()=>resolve(reader.result);reader.onerror=()=>reject(new Error('Falha ao ler imagem'));
+    reader.readAsDataURL(blob);
   });
 }
+function canvasToBlob(canvas,type,quality){
+  return new Promise(resolve=>canvas.toBlob(resolve,type,quality));
+}
+async function decodeImage(file){
+  if(window.createImageBitmap){
+    try{
+      const bitmap=await createImageBitmap(file,{imageOrientation:'from-image'});
+      return{source:bitmap,width:bitmap.width,height:bitmap.height,cleanup:()=>bitmap.close()};
+    }catch(e){}
+  }
+  return new Promise((resolve,reject)=>{
+    const url=URL.createObjectURL(file),img=new Image();
+    img.onload=()=>resolve({source:img,width:img.naturalWidth,height:img.naturalHeight,cleanup:()=>URL.revokeObjectURL(url)});
+    img.onerror=()=>{URL.revokeObjectURL(url);reject(new Error('Formato de imagem não suportado'));};
+    img.src=url;
+  });
+}
+async function compressImage(file){
+  if(file.size>MAX_SOURCE_BYTES)throw new Error('Imagem maior que 15 MB');
+  const decoded=await decodeImage(file);
+  try{
+    let scale=Math.min(1,1024/Math.max(decoded.width,decoded.height));
+    let best=null;
+    for(let resize=0;resize<4;resize++){
+      const canvas=document.createElement('canvas');
+      canvas.width=Math.max(1,Math.round(decoded.width*scale));canvas.height=Math.max(1,Math.round(decoded.height*scale));
+      const ctx=canvas.getContext('2d',{alpha:false});if(!ctx)throw new Error('Não foi possível processar a foto');
+      ctx.drawImage(decoded.source,0,0,canvas.width,canvas.height);
+      for(const quality of [.82,.72,.62,.52]){
+        let blob=await canvasToBlob(canvas,'image/webp',quality);
+        if(!blob)blob=await canvasToBlob(canvas,'image/jpeg',quality);
+        if(blob){best=blob;if(blob.size<=TARGET_IMAGE_BYTES)break;}
+      }
+      if(best&&best.size<=TARGET_IMAGE_BYTES)break;
+      scale*=.78;
+    }
+    if(!best)throw new Error('Não foi possível comprimir a foto');
+    const dataURL=await blobToDataURL(best);
+    if(!isSafeImageData(dataURL))throw new Error('A foto continuou muito grande após a otimização');
+    return dataURL;
+  }finally{decoded.cleanup();}
+}
+async function readFiles(list,online){
+  const key=online?'online':'local',target=online?photosOnline:photos;
+  if(online&&peer){showToast('Cancele a sala antes de alterar as fotos.');return;}
+  if(uploadBusy[key]){showToast('Aguarde o processamento atual...');return;}
+  const available=15-target.length;
+  const files=Array.from(list).filter(f=>f.type.startsWith('image/')).slice(0,available);
+  if(!files.length){showToast(available?'Selecione imagens válidas.':'Você já adicionou 15 fotos.');return;}
+  uploadBusy[key]=true;renderPhotos(online);
+  let failed=0;
+  for(const file of files){
+    try{target.push(await compressImage(file));renderPhotos(online);}
+    catch(e){failed++;console.warn(e);}
+  }
+  uploadBusy[key]=false;renderPhotos(online);
+  if(failed)showToast(`${failed} foto${failed>1?'s':''} não pôde${failed>1?'ram':''} ser processada${failed>1?'s':''}.`,3200);
+  else showToast('Fotos otimizadas com sucesso! ✅');
+}
 function removePhoto(idx,online){
+  if(online&&peer){showToast('Cancele a sala antes de alterar as fotos.');return;}
   if(online)photosOnline.splice(idx,1);else photos.splice(idx,1);
   renderPhotos(online);
 }
@@ -519,7 +599,9 @@ function renderPhotos(online){
     grid.appendChild(d);
   }
   const n=arr.length,cnt=document.getElementById(cntId),sb=document.getElementById(sbId);
-  if(n>=15){cnt.className='photos-count ok';cnt.textContent='✅ 15 fotos prontas!';if(sb)sb.disabled=false;}
+  const busy=uploadBusy[online?'online':'local'];
+  if(busy){cnt.className='photos-count warn';cnt.textContent=`Otimizando fotos... ${n} / 15`;if(sb)sb.disabled=true;}
+  else if(n>=15){cnt.className='photos-count ok';cnt.textContent='✅ 15 fotos prontas!';if(sb)sb.disabled=online&&!!peer;}
   else{cnt.className='photos-count warn';cnt.textContent=`${n} / 15 fotos adicionadas`;if(sb)sb.disabled=true;}
 }
 
@@ -547,19 +629,48 @@ function switchTab(tab){
   document.getElementById('panelJoin').classList.toggle('active',tab==='join');
 }
 
+function cleanPlayerName(value,fallback){
+  const name=String(value||'').replace(/[\u0000-\u001F\u007F]/g,'').trim().slice(0,18);
+  return name||fallback;
+}
+function isSafeImageData(value){
+  return typeof value==='string'&&value.length<=400000&&/^data:image\/(?:jpeg|png|webp|gif);base64,[a-z0-9+/=]+$/i.test(value);
+}
 function generateRoomCode(){
   const chars='ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no ambiguous chars (0,O,1,I)
-  let code='';
-  for(let i=0;i<6;i++) code+=chars[Math.floor(Math.random()*chars.length)];
+  const values=new Uint8Array(6);crypto.getRandomValues(values);
+  let code='';for(const value of values)code+=chars[value%chars.length];
   return code;
 }
 
+function destroyPeerTransport(){
+  const oldConn=conn,oldPeer=peer;conn=null;peer=null;
+  if(oldConn)try{oldConn.close();}catch(e){}
+  if(oldPeer)try{oldPeer.destroy();}catch(e){}
+}
+function updateOnlineButtons(){
+  const createBtn=document.getElementById('createRoomBtn'),joinBtn=document.getElementById('joinRoomBtn');
+  if(createBtn)createBtn.disabled=uploadBusy.online||photosOnline.length<15||!!peer;
+  if(joinBtn)joinBtn.disabled=!!peer;
+}
+function failJoin(message){
+  const dot=document.getElementById('joinStatusDot'),txt=document.getElementById('joinStatusText');
+  if(dot)dot.className='status-dot error';if(txt)txt.textContent=message;
+  isOnline=false;isHost=false;onlineStarted=false;destroyPeerTransport();updateOnlineButtons();
+}
+
 function createRoom(){
+  if(peer){showToast('Já existe uma tentativa em andamento.');return;}
+  if(photosOnline.length!==15||!photosOnline.every(isSafeImageData)){showToast('Revise as fotos antes de criar a sala.');return;}
   const createBtn=document.getElementById('createRoomBtn');
   createBtn.disabled=true; // prevent double-click creating multiple peers
   const nameInput=document.getElementById('onlineNameCreate');
-  myOnlineName=(nameInput.value.trim())||'Jogador 1';
-  isHost=true;isOnline=true;myTurnIndex=0;
+  myOnlineName=cleanPlayerName(nameInput.value,'Jogador 1');
+  isHost=true;isOnline=true;onlineStarted=false;myTurnIndex=0;
+  clearOnlineTimeouts();
+  document.getElementById('roomCreatedArea').style.display='none';
+  document.getElementById('hostStatusDot').className='status-dot waiting';
+  document.getElementById('hostStatusText').textContent='Criando sala...';
 
   // Init PeerJS with a readable room code
   const code=generateRoomCode();
@@ -569,11 +680,12 @@ function createRoom(){
     document.getElementById('roomCreatedArea').style.display='flex';
     document.getElementById('roomCodeDisplay').textContent=code;
     document.getElementById('roomCodeDisplay').onclick=()=>{
-      navigator.clipboard.writeText(code).then(()=>showToast('Código copiado! 📋'));
+      navigator.clipboard.writeText(code).then(()=>showToast('Código copiado! 📋')).catch(()=>showToast(`Código: ${code}`,3500));
     };
   });
 
   peer.on('connection',c=>{
+    if(conn){c.on('open',()=>c.close());return;}
     conn=c;
     document.getElementById('hostStatusDot').className='status-dot connected';
     document.getElementById('hostStatusText').textContent='Conectado! Iniciando jogo...';
@@ -584,11 +696,14 @@ function createRoom(){
     });
     conn.on('data',handleOnlineMessage);
     conn.on('close',()=>onlinePeerDisconnected());
+    conn.on('error',()=>onlinePeerDisconnected());
   });
 
   peer.on('error',e=>{
+    document.getElementById('roomCreatedArea').style.display='flex';
     document.getElementById('hostStatusDot').className='status-dot error';
     document.getElementById('hostStatusText').textContent='Erro: '+e.type+'. Tente novamente.';
+    isOnline=false;isHost=false;onlineStarted=false;destroyPeerTransport();updateOnlineButtons();
   });
 }
 
@@ -596,11 +711,12 @@ function joinRoom(){
   if(peer){showToast('Já está tentando conectar, aguarde...');return;}
   const nameInput=document.getElementById('onlineNameJoin');
   const codeInput=document.getElementById('roomCodeInput');
-  myOnlineName=(nameInput.value.trim())||'Jogador 2';
+  myOnlineName=cleanPlayerName(nameInput.value,'Jogador 2');
   const code=codeInput.value.trim().toUpperCase();
-  if(!code){showToast('Digite o código da sala!');return;}
+  if(!/^[A-HJ-NP-Z2-9]{6}$/.test(code)){showToast('Digite um código válido de 6 caracteres.');return;}
 
-  isHost=false;isOnline=true;myTurnIndex=1;
+  isHost=false;isOnline=true;onlineStarted=false;myTurnIndex=1;
+  clearOnlineTimeouts();updateOnlineButtons();
 
   const statusLine=document.getElementById('joinStatusLine');
   const statusDot =document.getElementById('joinStatusDot');
@@ -609,6 +725,7 @@ function joinRoom(){
   statusTxt.textContent='Conectando...';
 
   peer=new Peer({debug:0});
+  updateOnlineButtons();
   peer.on('open',()=>{
     conn=peer.connect('MF-'+code);
     conn.on('open',()=>{
@@ -625,66 +742,87 @@ function joinRoom(){
     });
     conn.on('data',handleOnlineMessage);
     conn.on('close',()=>onlinePeerDisconnected());
+    conn.on('error',()=>failJoin('A conexão com a sala foi interrompida. Tente novamente.'));
   });
   peer.on('error',e=>{
-    statusDot.className='status-dot error';
-    statusTxt.textContent='Não encontrou a sala. Verifique o código.';
+    failJoin('Não encontrou a sala. Verifique o código e tente novamente.');
   });
 }
 
 function handleOnlineMessage(msg){
+  if(!msg||typeof msg!=='object'||typeof msg.type!=='string')return;
   switch(msg.type){
     case 'START_BEGIN':
-      // Guest: first chunk arriving — initialise photos array
-      opponentName = msg.hostName;
-      photos = [];
-      msg.photos.forEach(p => photos.push(p));
+      // Guest: initialise a bounded transfer before receiving image fragments
+      if(isHost||msg.total!==15)return;
+      opponentName = cleanPlayerName(msg.hostName,'Jogador 1');incomingPhotoTotal=15;
+      photos = new Array(15).fill(null);incomingPhotoParts=new Map();
+      document.getElementById('joinStatusText').textContent='Recebendo fotos... 0/15';
       break;
 
-    case 'START_CHUNK':
-      // Guest: subsequent chunks
-      msg.photos.forEach(p => photos.push(p));
+    case 'PHOTO_CHUNK': {
+      if(isHost||incomingPhotoTotal!==15||!Number.isInteger(msg.index)||msg.index<0||msg.index>=15||
+         !Number.isInteger(msg.chunkIndex)||!Number.isInteger(msg.totalChunks)||msg.totalChunks<1||msg.totalChunks>10||
+         msg.chunkIndex<0||msg.chunkIndex>=msg.totalChunks||typeof msg.data!=='string'||msg.data.length>50000)return;
+      let entry=incomingPhotoParts.get(msg.index);
+      if(!entry){entry={parts:new Array(msg.totalChunks),received:0};incomingPhotoParts.set(msg.index,entry);}
+      if(entry.parts.length!==msg.totalChunks||entry.parts[msg.chunkIndex]!==undefined)return;
+      entry.parts[msg.chunkIndex]=msg.data;entry.received++;
+      if(entry.received===entry.parts.length){
+        const image=entry.parts.join('');
+        if(!isSafeImageData(image)){failJoin('Uma das fotos recebidas é inválida. Tente novamente.');return;}
+        photos[msg.index]=image;incomingPhotoParts.delete(msg.index);
+        const received=photos.filter(Boolean).length;
+        document.getElementById('joinStatusText').textContent=`Recebendo fotos... ${received}/15`;
+      }
       break;
+    }
 
 
 
     case 'HELLO': {
       // Host receives guest name — set up players and send photos in chunks
-      opponentName=msg.name;
+      if(!isHost||!conn||!conn.open||onlineStarted)return;
+      onlineStarted=true;
+      opponentName=cleanPlayerName(msg.name,'Jogador 2');
       players=[
         {name:myOnlineName, avatar:AVATARS[0],color:COLORS[0],bg:BGS[0],score:0,moves:0},
-        {name:msg.name,     avatar:AVATARS[1],color:COLORS[1],bg:BGS[1],score:0,moves:0},
+        {name:opponentName, avatar:AVATARS[1],color:COLORS[1],bg:BGS[1],score:0,moves:0},
       ];
       const seed=Date.now();
-      sendPhotosInChunks(photosOnline, myOnlineName, seed);
-      // Give enough time for all chunks to be sent before starting locally
-      setTimeout(()=>{
+      sendPhotosInChunks(photosOnline,myOnlineName,seed,()=>{
         seededShuffle(seed);
         launchOnlineGame();
-      }, 200 + photosOnline.length * 20);
+      });
       break;
     }
 
     case 'FLIP':
       // Opponent flipped a card
+      if(!Number.isInteger(msg.idx)||msg.idx<0||msg.idx>=cards.length||turn===myTurnIndex)return;
       remoteFlip(msg.idx);
       break;
 
     case 'RESTART_BEGIN':
       // Host is about to resend photos + new seed — clear photos to receive fresh
-      photos = [];
+      if(isHost)return;
+      clearGameTimeouts();canFlip=false;photos=[];incomingPhotoTotal=0;incomingPhotoParts=new Map();
       break;
 
     case 'START_DONE':
       // Also handles restart: guest receives new shuffled board
-      opponentName = msg.hostName;
-      if(!players.length){
+      if(isHost||msg.total!==15||photos.length!==15||!photos.every(isSafeImageData)||!Number.isFinite(msg.seed)){
+        showToast('Falha ao receber as fotos da partida.',3500);return;
+      }
+      opponentName = cleanPlayerName(msg.hostName,'Jogador 1');incomingPhotoTotal=0;
+      if(!onlineStarted){
         players=[
-          {name:msg.hostName, avatar:AVATARS[0],color:COLORS[0],bg:BGS[0],score:0,moves:0},
+          {name:opponentName, avatar:AVATARS[0],color:COLORS[0],bg:BGS[0],score:0,moves:0},
           {name:myOnlineName, avatar:AVATARS[1],color:COLORS[1],bg:BGS[1],score:0,moves:0},
         ];
+        onlineStarted=true;
       }
-      setTimeout(()=>{
+      onlineDelay(()=>{
         seededShuffle(msg.seed);
         // If game was running, reset board; otherwise full launch
         if(document.getElementById('game').classList.contains('active')){
@@ -704,6 +842,7 @@ function onlinePeerDisconnected(){
   // before treating it as a real disconnection
   clearTimeout(disconnectTimer);
   disconnectTimer = setTimeout(()=>{
+    if(!isOnline)return;
     // After grace period, check if conn is still dead
     if(conn && conn.open) return; // reconnected, ignore
     const gameActive = document.getElementById('game').classList.contains('active');
@@ -719,10 +858,11 @@ function onlinePeerReconnected(){
 }
 
 function cancelOnline(){
-  if(conn)try{conn.close();}catch(e){}
-  if(peer)try{peer.destroy();}catch(e){}
-  conn=null;peer=null;isOnline=false;isHost=false;
-  myTurnIndex=0;myOnlineName='';opponentName='';
+  isOnline=false;isHost=false;onlineStarted=false;clearTimeout(disconnectTimer);disconnectTimer=null;
+  clearOnlineTimeouts();clearGameTimeouts();destroyPeerTransport();
+  myTurnIndex=0;myOnlineName='';opponentName='';players=[];
+  incomingPhotoTotal=0;
+  incomingPhotoParts=new Map();
   // Reset lobby UI so it's clean on re-entry
   const dot=document.getElementById('hostStatusDot');
   const txt=document.getElementById('hostStatusText');
@@ -730,32 +870,46 @@ function cancelOnline(){
   if(txt) txt.textContent='Aguardando o outro jogador entrar...';
   document.getElementById('roomCreatedArea').style.display='none';
   document.getElementById('joinStatusLine').style.display='none';
+  updateOnlineButtons();
   // Reset tabs to default
   switchTab('create');
 }
 
 // Seeded shuffle using mulberry32
-// Send photos in batches of 3 to avoid exceeding WebRTC data channel limits
-function sendPhotosInChunks(photoArr, hostName, seed){
-  const CHUNK = 3;
+// Send small fragments so high-resolution family photos remain reliable on mobile WebRTC
+function sendPhotosInChunks(photoArr,hostName,seed,onComplete){
+  const DATA_CHUNK_SIZE=48000;
   const total = Math.min(photoArr.length, 15);
-  let sent = 0;
+
+  if(total!==15||!photoArr.slice(0,15).every(isSafeImageData)){
+    showToast('As fotos não estão prontas para envio.',3000);return;
+  }
+
+  if(!safeSend({type:'START_BEGIN',total,hostName,seed})){
+    showToast('Falha ao iniciar o envio das fotos.',3500);return;
+  }
+
+  const queue=[];
+  photoArr.slice(0,15).forEach((photo,index)=>{
+    const totalChunks=Math.ceil(photo.length/DATA_CHUNK_SIZE);
+    for(let chunkIndex=0;chunkIndex<totalChunks;chunkIndex++){
+      queue.push({type:'PHOTO_CHUNK',index,chunkIndex,totalChunks,data:photo.slice(chunkIndex*DATA_CHUNK_SIZE,(chunkIndex+1)*DATA_CHUNK_SIZE)});
+    }
+  });
+  let cursor=0,sentPhotos=0;
 
   function sendNext(){
-    const batch = photoArr.slice(sent, sent + CHUNK);
-    safeSend({
-      type: sent === 0 ? 'START_BEGIN' : 'START_CHUNK',
-      photos: batch,
-      offset: sent,
-      total: total,
-      hostName: hostName,
-      seed: seed,
-    });
-    sent += batch.length;
-    if(sent < total){
-      setTimeout(sendNext, 80);
+    const message=queue[cursor],ok=safeSend(message);
+    if(!ok){showToast('Falha ao enviar as fotos. Verifique a conexão.',3500);return;}
+    if(message.chunkIndex===message.totalChunks-1)sentPhotos++;
+    const status=document.getElementById('hostStatusText');if(status)status.textContent=`Enviando fotos... ${sentPhotos}/${total}`;
+    cursor++;
+    if(cursor<queue.length){
+      onlineDelay(sendNext,25);
     } else {
       safeSend({type:'START_DONE', hostName, seed, total});
+      if(status)status.textContent='Fotos enviadas! Iniciando jogo...';
+      if(onComplete)onlineDelay(onComplete,120);
     }
   }
   sendNext();
@@ -777,6 +931,8 @@ function seededShuffle(seed){
 }
 
 function launchOnlineGame(){
+  clearGameTimeouts();
+  onlineStarted=true;
   numPlayers=2;turn=0;
   clearInterval(timerHandle);
   timerSec=0;totalMoves=0;totalMatched=0;flipped=[];canFlip=true;gameRunning=false;
@@ -799,6 +955,7 @@ function launchOnlineGame(){
 }
 
 function resetOnlineBoard(){
+  clearGameTimeouts();
   turn=0;
   clearInterval(timerHandle);
   timerSec=0;totalMoves=0;totalMatched=0;flipped=[];canFlip=true;gameRunning=false;
@@ -828,6 +985,7 @@ function startLocalGame(){
 }
 
 function buildLocalBoard(){
+  clearGameTimeouts();
   clearInterval(timerHandle);
   timerSec=0;totalMoves=0;totalMatched=0;flipped=[];canFlip=true;gameRunning=false;
   players.forEach(p=>{p.score=0;p.moves=0;});
@@ -845,7 +1003,11 @@ function buildBoardFromCards(){
   board.innerHTML='';
   cards.forEach((card,i)=>{
     const el=document.createElement('div');el.className='card';el.dataset.index=i;
-    el.innerHTML=`<div class="card-inner"><div class="card-face card-back">🧩</div><div class="card-face card-front"><img src="${card.src}" alt="Foto" loading="lazy"></div></div>`;
+    const inner=document.createElement('div');inner.className='card-inner';
+    const back=document.createElement('div');back.className='card-face card-back';back.textContent='🧩';
+    const front=document.createElement('div');front.className='card-face card-front';
+    const img=document.createElement('img');img.src=card.src;img.alt=`Foto ${i%15+1}`;img.loading='lazy';
+    front.appendChild(img);inner.append(back,front);el.appendChild(inner);
     el.addEventListener('click',()=>{unlockAudio();onCardClick(i,el);});
     board.appendChild(el);
   });
@@ -862,17 +1024,17 @@ function handlePlayAgain(){
 function restartGame(){
   if(isOnline){
     if(!isHost){showToast('Só quem criou a sala pode reiniciar!');return;}
+    clearGameTimeouts();canFlip=false;
     // Re-send photos in chunks so guest gets a fresh board
     const restartSeed=Date.now();
     // First notify guest to prepare for new game
     safeSend({type:'RESTART_BEGIN'});
     // Then send photos again with new seed
-    setTimeout(()=>{
-      sendPhotosInChunks(photosOnline, myOnlineName, restartSeed);
-      setTimeout(()=>{
+    onlineDelay(()=>{
+      sendPhotosInChunks(photosOnline,myOnlineName,restartSeed,()=>{
         seededShuffle(restartSeed);
         resetOnlineBoard();
-      }, 200 + photosOnline.length * 20);
+      });
     }, 100);
   }else{
     turn=0;buildLocalBoard();showScreen('game');refreshTurnBanner(true);
@@ -911,10 +1073,11 @@ function refreshTurnBanner(animate=false){
 // ═══════════════════════════════ FLIP LOGIC ══════════════════════════════
 function safeSend(msg){
   try{
-    if(conn && conn.open) conn.send(msg);
+    if(conn&&conn.open){conn.send(msg);return true;}
   }catch(e){
     console.warn('safeSend failed:', e);
   }
+  return false;
 }
 
 function onCardClick(idx,el){
@@ -944,6 +1107,7 @@ function flipCard(idx,el){
 
 // Remote player flipped a card — directly apply visual + state (bypass local guards)
 function remoteFlip(idx){
+  if(!canFlip)return;
   const card=cards[idx];
   if(!card||card.matched||card.flipped)return;
   const el=document.getElementById('board').children[idx];
@@ -969,10 +1133,10 @@ function checkMatch(){
     sfx.match();totalMatched++;players[turn].score++;
     cards[a.idx].matched=cards[b.idx].matched=true;
     document.getElementById('pairsEl').textContent=`${totalMatched}/15`;
-    setTimeout(()=>{
+    gameDelay(()=>{
       a.el.classList.add('matched','matched-pop');b.el.classList.add('matched','matched-pop');
       flipped=[];refreshTurnBanner(false);
-      if(totalMatched===15){setTimeout(winGame,500);}
+      if(totalMatched===15){gameDelay(winGame,500);}
       else{
         if(numPlayers>1)showToast(`${players[turn].name} acertou! +1 par 🎉`);
         canFlip=true;
@@ -980,7 +1144,7 @@ function checkMatch(){
     },300);
   }else{
     sfx.wrong();a.el.classList.add('shake');b.el.classList.add('shake');
-    setTimeout(()=>{
+    gameDelay(()=>{
       a.el.classList.remove('flipped','shake');b.el.classList.remove('flipped','shake');
       cards[a.idx].flipped=cards[b.idx].flipped=false;flipped=[];
       if(numPlayers>1){turn=(turn+1)%numPlayers;refreshTurnBanner(true);}
@@ -1059,7 +1223,7 @@ function safeHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;')
 
 // ═══════════════════════════════ INIT ════════════════════════════════════
 renderPhotos(false);renderPhotos(true);
-setPlayerCount(1);renderNameInputs();
+setPlayerCount(1);updateOnlineButtons();
 </script>
 </body>
 </html>
